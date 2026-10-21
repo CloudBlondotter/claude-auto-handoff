@@ -495,7 +495,7 @@ describe('auto-handoff', () => {
     await settle(() => false)
     expect(calls.cleared).toBe(1)
 
-    calls.tokens = 90_000 // grew 59k past the floor
+    calls.tokens = 120_000 // grew 89k past the floor
     await $.turn.complete(TURN)
     await settle(() => calls.cleared > 1)
     expect(calls.cleared).toBe(2)
@@ -531,7 +531,7 @@ describe('auto-handoff', () => {
       await $.classic.SessionStart({ source: 'clear' })
       await settle(() => calls.seeded.length >= calls.cleared)
       await $.turn.complete(TURN) // seed turn sets the floor
-      calls.tokens += 60_000
+      calls.tokens += 90_000
     }
   }
 
@@ -549,19 +549,19 @@ describe('auto-handoff', () => {
     expect(calls.cleared).toBe(1)
   })
 
-  test('a seeded session gets 40k of headroom above its floor, not a config field', { options: { headroom: 1_000_000, growth: 1_000_000 } }, async ($, on) => {
+  test('a seeded session gets 80k of headroom above its floor, not a config field', { options: { headroom: 1_000_000, growth: 1_000_000 } }, async ($, on) => {
     const calls = engine(on, { tokens: 120_000, env: { AUTO_HANDOFF_TOKENS: '100000' } })
     await $.turn.complete(TURN)
     await settle(() => calls.cleared > 0)
     await $.classic.SessionStart({ source: 'clear' })
     await settle(() => calls.seeded.length > 0)
-    calls.tokens = 90_000 // floor 90k: the line moves to 130k
+    calls.tokens = 90_000 // floor 90k: the line moves to 170k
     await $.turn.complete(TURN) // seed turn sets the floor
     calls.tokens = 125_000
     await $.turn.complete(TURN)
     await settle(() => false)
-    expect(calls.cleared).toBe(1) // 125k: past the 100k threshold, short of floor + 40k
-    calls.tokens = 131_000
+    expect(calls.cleared).toBe(1) // 125k: past the 100k threshold, short of floor + 80k
+    calls.tokens = 171_000
     await $.turn.complete(TURN)
     await settle(() => calls.cleared > 1)
     expect(calls.cleared).toBe(2) // the ignored options did not hold it off
@@ -576,15 +576,15 @@ describe('auto-handoff', () => {
     await $.classic.SessionStart({ source: 'clear' })
     await settle(() => calls.seeded.length > 0)
     calls.tokens = 45_000
-    await $.turn.complete(TURN) // seed turn sets the floor: 35k of headroom, under the 40k minimum
-    const warning = "threshold 80k (AUTO_HANDOFF_TOKENS) leaves 35k this session's 45k start: handing off at 85k instead"
+    await $.turn.complete(TURN) // seed turn sets the floor: 35k of headroom, under the 80k minimum
+    const warning = "threshold 80k (AUTO_HANDOFF_TOKENS) leaves 35k this session's 45k start: handing off at 125k instead"
     expect(await band($)).toContain(`⚠ ${warning}`)
     calls.tokens = 81_000 // past 80k; the old math handed off here
     await $.turn.complete(TURN)
     await settle(() => false)
     expect(calls.cleared).toBe(1)
     expect((await band($)).split(warning).length - 1).toBe(1) // warned once, not every turn
-    calls.tokens = 86_000 // floor + 40k
+    calls.tokens = 126_000 // floor + 80k
     await $.turn.complete(TURN)
     await settle(() => calls.cleared > 1)
     expect(calls.cleared).toBe(2)

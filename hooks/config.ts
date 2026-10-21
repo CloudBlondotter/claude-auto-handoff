@@ -6,21 +6,23 @@ export const BRIEF_DIR = '.claude/state/auto-handoff'
 // threshold: matches HANDOFF_ARM_TOKENS in context-warning.ts.
 // MIN_HEADROOM and maxUnattended are loop guards. A seeded session must grow MIN_HEADROOM past its
 // first-turn size (its floor) before it can hand off again, and at most maxUnattended handoffs may
-// run before the user types a prompt. MIN_HEADROOM is fixed: seeded sessions start near 45k, so at
-// the default threshold it never moves the line; it only matters when the threshold is set low.
-// 40k is the empirical line where a seeded session can read its brief and still do real work. The
-// 2026-10-03 live run (threshold 20k, seeded sessions start at ~31k) chained six times with no
+// run before the user types a prompt. MIN_HEADROOM is fixed, not a share of the threshold. The floor
+// is mostly fixed overhead (system prompt, tool and MCP schemas, skills, memory), not the brief,
+// which Haiku caps at 4k: a lean setup starts near 45k, one with several MCP servers near 107k.
+// The 2026-10-03 live run (threshold 20k, seeded sessions start at ~31k) chained six times with no
 // guard; the 2026-10-04 run (AUTO_HANDOFF_TOKENS=80000 left in a shell, floor ~45k) chained eight
 // times with a guard of a quarter of the threshold, because max(80k, 45k + 20k) is still 80k, and
-// 35k of room goes in reading the brief. Progress, not time: a 15-minute chain cap could block a
-// real session that fills fast.
+// 35k of room goes in reading the brief. On 2026-10-21 (default 160k, floor ~107k) a 40k guard
+// never moved the line: 53k of room, and a seeded session handed off again after one Bash call.
+// 80k leaves room to read the brief and still do real work. Progress, not time: a 15-minute chain
+// cap could block a real session that fills fast.
 // The rest shape the brief: two template files and a pattern for files
 // that never count as edits.
 // viewer: where the mod serves the brief pages, "host:port"; "tailscale" as the host means this
 // machine's Tailscale IP, or 127.0.0.1 without Tailscale. Blank: no server, and the link is the local file.
 export type Config = { threshold: number; maxUnattended: number; briefTemplate: string; instructionsTemplate: string; ignoreFiles?: RegExp; viewer: string }
 export const DEFAULTS: Config = { threshold: 160_000, maxUnattended: 2, briefTemplate: '~/.claude/auto-handoff/brief.md', instructionsTemplate: '~/.claude/auto-handoff/instructions.md', viewer: 'tailscale:3846' }
-export const MIN_HEADROOM = 40_000
+export const MIN_HEADROOM = 80_000
 // Each template's default, a file in the mod's templates/ folder.
 export const TEMPLATES = [['briefTemplate', 'brief.md'], ['instructionsTemplate', 'instructions.md']] as const
 export type TemplateKey = typeof TEMPLATES[number][0]
