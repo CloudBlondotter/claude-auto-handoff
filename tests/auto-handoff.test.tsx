@@ -56,10 +56,11 @@ const posix = (p: string) => p.replace(/^[A-Za-z]:/, '').replace(/\\/g, '/')
 const files = (written: Record<string, string>) => Object.keys(written).filter(p => !p.endsWith('/auto-handoff.log'))
 
 // The engine beneath the plugin: everything the mod calls, answered from memory.
-function engine(on: On, opts: { tokens: number; files?: Record<string, string>; env?: Record<string, string>; brief?: string | null; messages?: SessionMessage[]; toolChars?: number; streamToolChars?: number; store?: Record<string, unknown>; stepUsage?: boolean; surfaces?: ('terminal' | 'desktop' | 'mobile' | 'vscode')[]; noSh?: boolean }): Calls {
+function engine(on: On, opts: { tokens: number; files?: Record<string, string>; env?: Record<string, string>; brief?: string | null; messages?: SessionMessage[]; toolChars?: number; streamToolChars?: number; store?: Record<string, unknown>; stepUsage?: boolean; surfaces?: ('terminal' | 'desktop' | 'mobile' | 'vscode')[]; noSh?: boolean; clear?: 'skipsMod' | 'keepsSession' }): Calls {
   const calls: Calls = { compacts: 0, steps: 0, cleared: 0, seeded: [], written: {}, completes: 0, tokens: opts.tokens, prompts: [], toasts: [], ran: 0 }
   let sessionId = 'old-session'
   let clears = 0
+  let clearing: (() => void) | undefined
   mock.env(on, { HOME: '/home/test', ...(opts.env ?? {}) })
   clock = mock.clock(on) // the panel's spinner and collapse timers
   on('session.surfaces', async () => ({ value: opts.surfaces ?? ['terminal'] }))
@@ -115,16 +116,27 @@ function engine(on: On, opts: { tokens: number; files?: Record<string, string>; 
     calls.toasts.push(e.text)
     return { value: undefined }
   })
+  // The real /clear settles only after classic.SessionStart has run, so it waits for the test's
+  // SessionStart call. skipsMod: a plugin above sends that event past the mod and /clear settles
+  // on its own; keepsSession: it settles with the session unchanged.
   on('command.run', async () => {
     calls.cleared++
+    if (opts.clear === 'keepsSession') return {}
     sessionId = `new-session-${++clears}`
+    if (opts.clear !== 'skipsMod') await new Promise<void>(r => { clearing = r })
     return {}
   })
   on('prompt.submit', async (_$, e) => {
     calls.seeded.push(e.text)
     return { text: e.text }
   })
-  on('classic.SessionStart', async () => ({}))
+  on('classic.SessionStart', async () => {
+    // Released after the mod's own SessionStart work, as the engine does.
+    const done = clearing
+    clearing = undefined
+    if (done) setTimeout(done, 0)
+    return {}
+  })
   on('session.compact', async (_$, e) => {
     calls.compacts++
     return { messages: e.messages }
@@ -207,6 +219,27 @@ describe('auto-handoff', () => {
     expect(calls.seeded[0]).toContain('Read the brief at /home/test/.claude/state/auto-handoff/old-session.md')
     expect(calls.seeded[0]).not.toContain('Finish the parser refactor')
     expect(calls.seeded[0]?.split('\n').length).toBe(1)
+  })
+
+  test('a SessionStart sent past the mod still seeds once /clear settles', async ($, on) => {
+    const calls = engine(on, { tokens: 165_000, clear: 'skipsMod' })
+    await $.turn.complete(TURN)
+    await settle(() => calls.seeded.length > 0)
+    expect(calls.cleared).toBe(1)
+    expect(calls.seeded.length).toBe(1)
+    expect(calls.seeded[0]).toContain('Read the brief at /home/test/.claude/state/auto-handoff/old-session.md')
+    const log = calls.written['/home/test/.claude/state/auto-handoff/auto-handoff.log'] ?? ''
+    expect(log).toContain('seeding after /clear')
+    expect(log).toContain('seeding new=new-session-1 from=old-session')
+  })
+
+  test('a /clear that leaves the session in place is a failure, not a seed', async ($, on) => {
+    const calls = engine(on, { tokens: 165_000, clear: 'keepsSession' })
+    await $.turn.complete(TURN)
+    const logged = () => calls.written['/home/test/.claude/state/auto-handoff/auto-handoff.log'] ?? ''
+    await settle(() => logged().includes('clear settled'))
+    expect(logged()).toContain('clear settled without a new session session=old-session')
+    expect(calls.seeded.length).toBe(0)
   })
 
   test('fires once per session', async ($, on) => {

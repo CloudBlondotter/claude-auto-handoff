@@ -241,7 +241,19 @@ async function handoff($: EngineInterface, sessionId: string, tokens: number, th
     steps($, [briefStep(problem), { mark: 'spin', text: 'clearing' }])
     await $.store.set(`fired:${sessionId}`, problem ? `clearing-facts-only:${problem}` : 'clearing')
     await log($, `brief written ${briefPath} (${brief.length} chars); queueing /clear`)
-    $.command.run({ command: 'clear' }).catch(async (err: unknown) => {
+    $.command.run({ command: 'clear' }).then(async () => {
+      // classic.SessionStart normally seeds during the /clear. A plugin above this one can send
+      // that event past it with next.to (the built-in cc-plugin-sec-default does), so a handoff
+      // still pending once /clear settles seeds from here.
+      if (pending?.oldSession !== sessionId) return
+      if (await $.session.id() === sessionId) {
+        pending = undefined
+        failed($, '/clear left the session in place', `this session keeps going; the brief is at ${briefPath}`)
+        return log($, `clear settled without a new session session=${sessionId}`)
+      }
+      await log($, `classic.SessionStart never reached this mod; seeding after /clear`)
+      await seed($)
+    }).catch(async (err: unknown) => {
       pending = undefined
       // fired stays 'clearing', so this session does not try again; it carries on as it is.
       failed($, '/clear was rejected', `this session keeps going; the brief is at ${briefPath}`)
@@ -573,43 +585,49 @@ export const register: Register = (on, options) => {
     }
     // A /clear of the person's own leaves no handoff to report; the panel from the last one goes too.
     if (e.source === 'clear' && !pending && !inFlight && shown) hidePanel($)
-    if (e.source !== 'clear' || !pending) return r
-    const p = pending
-    pending = undefined
-    try {
-      const newSession = await $.session.id()
-      seededSession = newSession
-      floor = undefined
-      unmeasured = 0
-      await $.store.set(`fired:${p.oldSession}`, `seeded:${newSession}`)
-      await log($, `seeding new=${newSession} from=${p.oldSession}`)
-      handedFrom = { session: p.oldSession, tokens: p.tokens, link: p.link, problem: p.problem }
-      steps($, [briefStep(p.problem), { mark: 'done', text: 'cleared' }, { mark: 'spin', text: 'starting the fresh session' }])
-      const own = await storedLineage($, p.oldSession)
-      const prior = own ? own.depth : 1
-      lineage = { from: p.oldSession, chain: p.chain, depth: prior !== undefined ? prior + 1 : undefined }
-      await $.store.set(`lineage:${newSession}`, lineage)
-      // The old brief learns where it went, and its chain's pages link forward.
-      try {
-        const old = parseBrief(await $.fs.read(p.briefPath) as string)
-        // viewer: the page link, read by the status line script for the session it handed off to.
-        await $.fs.write(p.briefPath, withHeader({ ...old.header, to: newSession, ...(p.link ? { viewer: p.link } : {}) }, old.body))
-        const briefDir = p.briefPath.replace(/\/[^/]+$/, '')
-        await viewer($, briefDir, `${briefDir}/pages`, p.oldSession)
-      } catch (err) {
-        await log($, `viewer forward link failed ${String(err)}`)
-      }
-      // One line on screen; the model reads the brief from disk. A full brief as the
-      // seed showed up as a wall of text the person never wrote.
-      const text = `${SEED_PREFIX} ${short(p.oldSession)}. The previous session hit its context limit and was cleared. Read the brief at ${p.briefPath} before doing anything else${p.link ? ` (readable copy: ${p.link})` : ''} and follow its Instructions section. Open your first reply with the line "↪ Handoff from session ${short(p.oldSession)}".`
-      $.prompt.submit({ text }).catch((err: unknown) => {
-        handedFrom = undefined
-        failed($, 'the seed prompt was rejected', `paste the brief path to carry on: ${p.briefPath}`)
-        return log($, `seed rejected ${String(err)}`)
-      })
-    } catch (err) {
-      await log($, `seed error ${String(err)}`)
-    }
+    if (e.source === 'clear' && pending) await seed($)
     return r
   })
+}
+
+// Seeds the fresh session with the pending handoff, once: from classic.SessionStart, or from
+// the settled /clear when that event never reached this mod.
+async function seed($: EngineInterface) {
+  const p = pending
+  if (!p) return
+  pending = undefined
+  try {
+    const newSession = await $.session.id()
+    seededSession = newSession
+    floor = undefined
+    unmeasured = 0
+    await $.store.set(`fired:${p.oldSession}`, `seeded:${newSession}`)
+    await log($, `seeding new=${newSession} from=${p.oldSession}`)
+    handedFrom = { session: p.oldSession, tokens: p.tokens, link: p.link, problem: p.problem }
+    steps($, [briefStep(p.problem), { mark: 'done', text: 'cleared' }, { mark: 'spin', text: 'starting the fresh session' }])
+    const own = await storedLineage($, p.oldSession)
+    const prior = own ? own.depth : 1
+    lineage = { from: p.oldSession, chain: p.chain, depth: prior !== undefined ? prior + 1 : undefined }
+    await $.store.set(`lineage:${newSession}`, lineage)
+    // The old brief learns where it went, and its chain's pages link forward.
+    try {
+      const old = parseBrief(await $.fs.read(p.briefPath) as string)
+      // viewer: the page link, read by the status line script for the session it handed off to.
+      await $.fs.write(p.briefPath, withHeader({ ...old.header, to: newSession, ...(p.link ? { viewer: p.link } : {}) }, old.body))
+      const briefDir = p.briefPath.replace(/\/[^/]+$/, '')
+      await viewer($, briefDir, `${briefDir}/pages`, p.oldSession)
+    } catch (err) {
+      await log($, `viewer forward link failed ${String(err)}`)
+    }
+    // One line on screen; the model reads the brief from disk. A full brief as the
+    // seed showed up as a wall of text the person never wrote.
+    const text = `${SEED_PREFIX} ${short(p.oldSession)}. The previous session hit its context limit and was cleared. Read the brief at ${p.briefPath} before doing anything else${p.link ? ` (readable copy: ${p.link})` : ''} and follow its Instructions section. Open your first reply with the line "↪ Handoff from session ${short(p.oldSession)}".`
+    $.prompt.submit({ text }).catch((err: unknown) => {
+      handedFrom = undefined
+      failed($, 'the seed prompt was rejected', `paste the brief path to carry on: ${p.briefPath}`)
+      return log($, `seed rejected ${String(err)}`)
+    })
+  } catch (err) {
+    await log($, `seed error ${String(err)}`)
+  }
 }
