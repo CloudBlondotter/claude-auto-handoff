@@ -248,6 +248,8 @@ async function handoff($: EngineInterface, sessionId: string, tokens: number, th
       if (pending?.oldSession !== sessionId) return
       if (await $.session.id() === sessionId) {
         pending = undefined
+        // Not 'clearing', which a typed prompt resets: this /clear settled, so it does not retry.
+        await $.store.set(`fired:${sessionId}`, 'clear-kept-session')
         failed($, '/clear left the session in place', `this session keeps going; the brief is at ${briefPath}`)
         return log($, `clear settled without a new session session=${sessionId}`)
       }
@@ -255,9 +257,11 @@ async function handoff($: EngineInterface, sessionId: string, tokens: number, th
       await seed($)
     }).catch(async (err: unknown) => {
       pending = undefined
-      // fired stays 'clearing', so this session does not try again; it carries on as it is.
       failed($, '/clear was rejected', `this session keeps going; the brief is at ${briefPath}`)
       await log($, `clear rejected ${String(err)}`)
+      // Marked fired, so this session does not try again; it carries on as it is. Should the write
+      // fail too (the module unloading), 'clearing' stays and the next typed prompt resets it.
+      await $.store.set(`fired:${sessionId}`, 'clear-rejected').catch(() => {})
     })
   } catch (err) {
     pending = undefined
@@ -572,6 +576,7 @@ export const register: Register = (on, options) => {
       unattended = 0
       if (pausedSession) hidePanel($) // the pause panel's "send a message to resume" is done
       pausedSession = undefined
+      await resetStuckClear($)
     }
     return next(e)
   })
@@ -588,6 +593,22 @@ export const register: Register = (on, options) => {
     if (e.source === 'clear' && pending) await seed($)
     return r
   })
+}
+
+// A 'clearing' marker with no /clear pending for this session means the /clear never settled:
+// Claude Code exited first and --resume came back to the old session. Without a reset the
+// marker reads as fired forever. Dropped on a typed prompt, so the next turn hands off again.
+async function resetStuckClear($: EngineInterface) {
+  try {
+    const sessionId = await $.session.id()
+    if (inFlight || pending?.oldSession === sessionId) return
+    const fired = await $.store.get(`fired:${sessionId}`)
+    if (typeof fired !== 'string' || !fired.startsWith('clearing')) return
+    await $.store.delete(`fired:${sessionId}`)
+    await log($, `stale ${fired} marker session=${sessionId} (/clear never settled); cleared on a user prompt`)
+  } catch (err) {
+    await log($, `stuck clear reset error ${String(err)}`)
+  }
 }
 
 // Seeds the fresh session with the pending handoff, once: from classic.SessionStart, or from

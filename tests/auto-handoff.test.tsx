@@ -711,6 +711,44 @@ describe('auto-handoff', () => {
     expect(calls.completes).toBe(0)
   })
 
+  test('a clearing marker blocks the handoff until the person types', async ($, on) => {
+    const calls = engine(on, { tokens: 165_000, store: { 'fired:old-session': 'clearing' } })
+    await $.turn.complete(TURN)
+    await settle(() => false)
+    expect(calls.completes).toBe(0)
+  })
+
+  test('a clearing marker from a /clear that never settled is reset by a typed prompt', async ($, on) => {
+    // Seen live: Claude Code exited before /clear settled; --resume came back to a session marked fired for good.
+    const calls = engine(on, { tokens: 165_000, store: { 'fired:old-session': 'clearing-facts-only:empty' } })
+    await $.prompt.submit({ text: 'keep going', origin: { kind: 'composer' } } as never)
+    await $.turn.complete(TURN)
+    await settle(() => calls.cleared > 0)
+    expect(calls.completes).toBe(1)
+    expect(calls.cleared).toBe(1)
+    expect(calls.written['/home/test/.claude/state/auto-handoff/auto-handoff.log']).toContain('stale clearing-facts-only:empty marker session=old-session')
+  })
+
+  test('a plugin prompt leaves a clearing marker in place', async ($, on) => {
+    const calls = engine(on, { tokens: 165_000, store: { 'fired:old-session': 'clearing' } })
+    await $.prompt.submit({ text: 'from a plugin', origin: { kind: 'plugin', name: 'other' } } as never)
+    await $.turn.complete(TURN)
+    await settle(() => false)
+    expect(calls.completes).toBe(0)
+  })
+
+  test('a /clear that settled in place does not retry after a typed prompt', async ($, on) => {
+    const calls = engine(on, { tokens: 165_000, clear: 'keepsSession' })
+    await $.turn.complete(TURN)
+    const logged = () => calls.written['/home/test/.claude/state/auto-handoff/auto-handoff.log'] ?? ''
+    await settle(() => logged().includes('clear settled'))
+    await $.prompt.submit({ text: 'keep going', origin: { kind: 'composer' } } as never)
+    await $.turn.complete(TURN)
+    await settle(() => false)
+    expect(calls.completes).toBe(1)
+    expect(calls.cleared).toBe(1)
+  })
+
   test('the panel above the prompt walks the handoff, then collapses', async ($, on) => {
     const calls = engine(on, { tokens: 165_000, stepUsage: true })
     expect(await band($)).toBe('')
