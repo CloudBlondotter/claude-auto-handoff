@@ -5,7 +5,7 @@ import type { Entry } from './viewer.ts'
 import { SERVER_JS, parseAddress } from './server.ts'
 import { isSpinning, panelTree } from './panel.tsx'
 import type { Line, Panel } from './panel.tsx'
-import { BRIEF_DIR, DEFAULTS, LAST_RESORT_INSTRUCTIONS, MIN_HEADROOM, SEED_PREFIX, TEMPLATES, expand, k, linkify, parseConfig, short } from './config.ts'
+import { BRIEF_DIR, DEFAULTS, LAST_RESORT_INSTRUCTIONS, MIN_HEADROOM, SEED_PREFIX, TEMPLATES, expand, k, linkify, nextTitle, parseConfig, short } from './config.ts'
 import type { Config, TemplateKey } from './config.ts'
 
 // At the token threshold, Haiku writes a handoff brief, the mod runs /clear, then seeds the
@@ -22,7 +22,7 @@ const CHARS_PER_TOKEN = 4
 const LOG = `~/${BRIEF_DIR}/auto-handoff.log`
 
 // problem: why the brief is facts only, when Haiku's summary was unusable.
-type Pending = { oldSession: string; briefPath: string; tokens: number; chain: string; link: string; problem?: string }
+type Pending = { oldSession: string; briefPath: string; tokens: number; chain: string; link: string; problem?: string; title?: string }
 
 
 
@@ -51,6 +51,10 @@ let unmeasured = 0
 let gated: string | undefined
 // From the latest SessionStart; /clear starts a new transcript file.
 let transcriptPath: string | undefined
+// The session's title (a /rename or the AI title) as the latest classic.UserPromptSubmit reported it.
+let lastTitle: { session: string; title: string } | undefined
+// The title the seed prompt gives the fresh session, after its parent's.
+let seedTitle: string | undefined
 
 // Windows sets USERPROFILE, not HOME. With HOME unset, every path built on it began with
 // "undefined/", which $.fs resolves under the session's working directory: briefs, templates
@@ -237,7 +241,7 @@ async function handoff($: EngineInterface, sessionId: string, tokens: number, th
     const header = { from: own?.from, chain, depth: depth !== undefined ? String(depth) : undefined, tokens: String(tokens), at: new Date().toISOString(), cwd }
     await $.fs.write(briefPath, withHeader(header, brief))
     const link = await viewer($, briefDir, pagesDir, sessionId)
-    pending = { oldSession: sessionId, briefPath, tokens, chain, link, problem }
+    pending = { oldSession: sessionId, briefPath, tokens, chain, link, problem, title: lastTitle?.session === sessionId ? lastTitle.title : undefined }
     steps($, [briefStep(problem), { mark: 'spin', text: 'clearing' }])
     await $.store.set(`fired:${sessionId}`, problem ? `clearing-facts-only:${problem}` : 'clearing')
     await log($, `brief written ${briefPath} (${brief.length} chars); queueing /clear`)
@@ -581,6 +585,20 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
+  // Remembers the title for the next handoff, and names the fresh session after its parent's.
+  on('classic.UserPromptSubmit', async ($, e, next) => {
+    const r = await next(e)
+    if (seedTitle && e.prompt.startsWith(SEED_PREFIX)) {
+      const title = seedTitle
+      seedTitle = undefined
+      lastTitle = { session: e.session_id, title }
+      await log($, `titling session=${e.session_id} "${title}"`)
+      return { ...r, sessionTitle: title }
+    }
+    if (e.session_title) lastTitle = { session: e.session_id, title: e.session_title }
+    return r
+  })
+
   on('classic.SessionStart', async ($, e, next) => {
     const r = await next(e)
     if (e.transcript_path) transcriptPath = e.transcript_path
@@ -625,6 +643,7 @@ async function seed($: EngineInterface) {
     await $.store.set(`fired:${p.oldSession}`, `seeded:${newSession}`)
     await log($, `seeding new=${newSession} from=${p.oldSession}`)
     handedFrom = { session: p.oldSession, tokens: p.tokens, link: p.link, problem: p.problem }
+    seedTitle = p.title ? nextTitle(p.title) : undefined
     steps($, [briefStep(p.problem), { mark: 'done', text: 'cleared' }, { mark: 'spin', text: 'starting the fresh session' }])
     const own = await storedLineage($, p.oldSession)
     const prior = own ? own.depth : 1

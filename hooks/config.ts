@@ -31,6 +31,12 @@ export const LAST_RESORT_INSTRUCTIONS = '## Instructions\n\nThis turn was trigge
 
 export const k = (n: number) => `${Math.round(n / 1000)}k`
 export const short = (sessionId: string) => sessionId.slice(0, 8)
+// The fresh session's title after its parent's: "IAS025 Albaranes" becomes "IAS025 Albaranes pt2", and "... pt2" becomes "... pt3".
+export function nextTitle(title: string): string {
+  const t = title.trim()
+  const m = /^(.*\S)\s+pt(\d+)$/.exec(t)
+  return m ? `${m[1]} pt${Number(m[2]) + 1}` : `${t} pt2`
+}
 export const expand = (path: string, home: string) => path.replace(/^~(?=\/|$)/, home)
 
 // A non-positive or non-numeric value falls back to the default rather than handing off at 0.

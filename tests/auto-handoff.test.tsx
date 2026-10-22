@@ -4,6 +4,7 @@ import type { On, SessionMessage } from 'claude-code'
 import { briefPrompt, extractFacts, factsBlock, hasUnansweredLastRequest, isValidBrief, markUnverifiedFigures } from '../hooks/brief.ts'
 import { renderTemplate } from '../hooks/templates.ts'
 import { parseBrief } from '../hooks/viewer.ts'
+import { nextTitle } from '../hooks/config.ts'
 
 type Calls = { compacts: number; steps: number; cleared: number; seeded: string[]; written: Record<string, string>; completes: number; tokens: number; prompts: string[]; toasts: string[]; ran: number }
 
@@ -137,6 +138,7 @@ function engine(on: On, opts: { tokens: number; files?: Record<string, string>; 
     if (done) setTimeout(done, 0)
     return {}
   })
+  on('classic.UserPromptSubmit', async () => ({}))
   on('session.compact', async (_$, e) => {
     calls.compacts++
     return { messages: e.messages }
@@ -231,6 +233,26 @@ describe('auto-handoff', () => {
     const log = calls.written['/home/test/.claude/state/auto-handoff/auto-handoff.log'] ?? ''
     expect(log).toContain('seeding after /clear')
     expect(log).toContain('seeding new=new-session-1 from=old-session')
+  })
+
+  test('the fresh session is titled after its parent', async ($, on) => {
+    const calls = engine(on, { tokens: 165_000, clear: 'skipsMod' })
+    await $.classic.UserPromptSubmit({ prompt: 'fix the parser', session_id: 'old-session', session_title: 'IAS025 Albaranes' })
+    await $.turn.complete(TURN)
+    await settle(() => calls.seeded.length > 0)
+    const seeded = await $.classic.UserPromptSubmit({ prompt: calls.seeded[0]!, session_id: 'new-session-1' })
+    expect(seeded.sessionTitle).toBe('IAS025 Albaranes pt2')
+    // Only the seed is retitled; the person's next prompt leaves the title alone.
+    const typed = await $.classic.UserPromptSubmit({ prompt: 'carry on', session_id: 'new-session-1', session_title: 'IAS025 Albaranes pt2' })
+    expect(typed.sessionTitle).toBeUndefined()
+  })
+
+  test('a parent with no title leaves the fresh session untitled', async ($, on) => {
+    const calls = engine(on, { tokens: 165_000, clear: 'skipsMod' })
+    await $.turn.complete(TURN)
+    await settle(() => calls.seeded.length > 0)
+    const seeded = await $.classic.UserPromptSubmit({ prompt: calls.seeded[0]!, session_id: 'new-session-1' })
+    expect(seeded.sessionTitle).toBeUndefined()
   })
 
   test('a /clear that leaves the session in place is a failure, not a seed', async ($, on) => {
@@ -950,6 +972,14 @@ describe('extractFacts', () => {
     const template = '## Work in Progress\nWhat was happening.\n\n## Next Step\nThe next action.'
     expect(isValidBrief('## Next Step\nGo.', template)).toBe(true)
     expect(isValidBrief('Sure! Here is a summary.', template)).toBe(false)
+  })
+})
+
+describe('nextTitle', () => {
+  test('appends pt2, then counts up', () => {
+    expect(nextTitle('IAS025 Albaranes')).toBe('IAS025 Albaranes pt2')
+    expect(nextTitle('IAS025 Albaranes pt2')).toBe('IAS025 Albaranes pt3')
+    expect(nextTitle(' IAS025 Albaranes pt9 ')).toBe('IAS025 Albaranes pt10')
   })
 })
 
