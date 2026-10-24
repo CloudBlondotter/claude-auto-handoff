@@ -6,7 +6,7 @@ import { renderTemplate } from '../hooks/templates.ts'
 import { parseBrief } from '../hooks/viewer.ts'
 import { nextTitle } from '../hooks/config.ts'
 
-type Calls = { compacts: number; steps: number; cleared: number; seeded: string[]; written: Record<string, string>; completes: number; tokens: number; prompts: string[]; toasts: string[]; ran: number }
+type Calls = { compacts: number; steps: number; cleared: number; seeded: string[]; written: Record<string, string>; completes: number; tokens: number; prompts: string[]; toasts: string[]; ran: number; renamed: string[] }
 
 // The test runs sandboxed, with no file access, so these stand in for the files in templates/:
 // the same headings and switches, shorter prose.
@@ -57,8 +57,8 @@ const posix = (p: string) => p.replace(/^[A-Za-z]:/, '').replace(/\\/g, '/')
 const files = (written: Record<string, string>) => Object.keys(written).filter(p => !p.endsWith('/auto-handoff.log'))
 
 // The engine beneath the plugin: everything the mod calls, answered from memory.
-function engine(on: On, opts: { tokens: number; files?: Record<string, string>; env?: Record<string, string>; brief?: string | null; messages?: SessionMessage[]; toolChars?: number; streamToolChars?: number; store?: Record<string, unknown>; stepUsage?: boolean; surfaces?: ('terminal' | 'desktop' | 'mobile' | 'vscode')[]; noSh?: boolean; clear?: 'skipsMod' | 'keepsSession' }): Calls {
-  const calls: Calls = { compacts: 0, steps: 0, cleared: 0, seeded: [], written: {}, completes: 0, tokens: opts.tokens, prompts: [], toasts: [], ran: 0 }
+function engine(on: On, opts: { tokens: number; files?: Record<string, string>; env?: Record<string, string>; brief?: string | null; messages?: SessionMessage[]; toolChars?: number; streamToolChars?: number; store?: Record<string, unknown>; stepUsage?: boolean; surfaces?: ('terminal' | 'desktop' | 'mobile' | 'vscode')[]; noSh?: boolean; clear?: 'skipsMod' | 'keepsSession'; transcript?: string }): Calls {
+  const calls: Calls = { compacts: 0, steps: 0, cleared: 0, seeded: [], written: {}, completes: 0, tokens: opts.tokens, prompts: [], toasts: [], ran: 0, renamed: [] }
   let sessionId = 'old-session'
   let clears = 0
   let clearing: (() => void) | undefined
@@ -107,6 +107,11 @@ function engine(on: On, opts: { tokens: number; files?: Record<string, string>; 
   on('process.run', async (_$, e) => {
     // No `sh`, as on Windows: every sh call refused. The log's `sh` append is kept in the file store.
     if (opts.noSh && e.argv[0] === 'sh') throw new Error('ENOENT sh')
+    // The title lines grep finds in the transcript.
+    if (e.argv[0] === 'grep') {
+      const lines = (opts.transcript ?? '').split('\n').filter(l => /"type":"(custom|ai)-title"/.test(l))
+      return { value: { exitCode: lines.length ? 0 : 1, stdout: lines.map(l => `${l}\n`).join(''), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
     if (e.argv[0] === 'sh' && e.argv[2]?.includes('>> "$2"')) {
       const path = posix(e.argv[5] ?? '')
       calls.written[path] = `${calls.written[path] ?? ''}${e.argv[4]}\n`
@@ -120,7 +125,11 @@ function engine(on: On, opts: { tokens: number; files?: Record<string, string>; 
   // The real /clear settles only after classic.SessionStart has run, so it waits for the test's
   // SessionStart call. skipsMod: a plugin above sends that event past the mod and /clear settles
   // on its own; keepsSession: it settles with the session unchanged.
-  on('command.run', async () => {
+  on('command.run', async (_$, e) => {
+    if (e.command === 'rename') {
+      calls.renamed.push(e.args)
+      return {}
+    }
     calls.cleared++
     if (opts.clear === 'keepsSession') return {}
     sessionId = `new-session-${++clears}`
@@ -206,7 +215,7 @@ describe('auto-handoff', () => {
     await $.turn.complete(TURN)
     await settle(() => calls.cleared > 0)
     expect(calls.completes).toBe(1)
-    expect(files(calls.written)).toEqual(['/home/test/.claude/state/auto-handoff/old-session.md', '/home/test/.claude/state/auto-handoff/pages/old-session.html'])
+    expect(files(calls.written)).toEqual(['/home/test/.claude/auto-handoff/brief.md', '/home/test/.claude/auto-handoff/instructions.md', '/home/test/.claude/state/auto-handoff/old-session.md', '/home/test/.claude/state/auto-handoff/pages/old-session.html'])
     expect(calls.written['/home/test/.claude/state/auto-handoff/old-session.md']).toContain('Finish the parser refactor')
     // The log is how a failed handoff gets diagnosed: it must name the threshold and the brief.
     const log = calls.written['/home/test/.claude/state/auto-handoff/auto-handoff.log'] ?? ''
@@ -245,6 +254,63 @@ describe('auto-handoff', () => {
     // Only the seed is retitled; the person's next prompt leaves the title alone.
     const typed = await $.classic.UserPromptSubmit({ prompt: 'carry on', session_id: 'new-session-1', session_title: 'IAS025 Albaranes pt2' })
     expect(typed.sessionTitle).toBeUndefined()
+  })
+
+  test('with UserPromptSubmit sent past the mod, the title comes from the transcript and /rename sets it', async ($, on) => {
+    const transcript = [
+      '{"type":"user","message":{"content":"fix the parser"},"sessionId":"old-session"}',
+      '{"type":"ai-title","aiTitle":"Parser refactor","sessionId":"old-session"}',
+      '{"type":"custom-title","customTitle":"IAS025 Albaranes","sessionId":"old-session"}',
+      '{"type":"ai-title","aiTitle":"Later AI title","sessionId":"old-session"}',
+    ].join('\n')
+    const calls = engine(on, { tokens: 165_000, clear: 'skipsMod', transcript })
+    await $.turn.complete(TURN)
+    await settle(() => calls.seeded.length > 0)
+    expect(calls.cleared).toBe(1)
+    expect(calls.renamed).toEqual([])
+    // The seed turn ends: the fresh session takes its parent's /rename title, once.
+    await $.turn.complete(TURN)
+    await settle(() => calls.renamed.length > 0)
+    expect(calls.renamed).toEqual(['IAS025 Albaranes pt2'])
+    await $.turn.complete(TURN)
+    expect(calls.renamed).toEqual(['IAS025 Albaranes pt2'])
+  })
+
+  test('an AI title stands in when the parent was never renamed', async ($, on) => {
+    const transcript = '{"type":"ai-title","aiTitle":"Parser refactor","sessionId":"old-session"}'
+    const calls = engine(on, { tokens: 165_000, clear: 'skipsMod', transcript })
+    await $.turn.complete(TURN)
+    await settle(() => calls.seeded.length > 0)
+    await $.turn.complete(TURN)
+    await settle(() => calls.renamed.length > 0)
+    expect(calls.renamed).toEqual(['Parser refactor pt2'])
+  })
+
+  test('a seed titled by classic.UserPromptSubmit is not renamed again', async ($, on) => {
+    const calls = engine(on, { tokens: 165_000, clear: 'skipsMod' })
+    await $.classic.UserPromptSubmit({ prompt: 'fix the parser', session_id: 'old-session', session_title: 'IAS025 Albaranes' })
+    await $.turn.complete(TURN)
+    await settle(() => calls.seeded.length > 0)
+    const seeded = await $.classic.UserPromptSubmit({ prompt: calls.seeded[0]!, session_id: 'new-session-1' })
+    expect(seeded.sessionTitle).toBe('IAS025 Albaranes pt2')
+    await $.turn.complete(TURN)
+    await settle(() => false)
+    expect(calls.renamed).toEqual([])
+  })
+
+  test('without SessionStart the brief points at the transcript under CLAUDE_CONFIG_DIR', async ($, on) => {
+    const calls = engine(on, { tokens: 165_000, clear: 'skipsMod', env: { CLAUDE_CONFIG_DIR: '/home/test/.claude-edu' } })
+    await $.turn.complete(TURN)
+    await settle(() => calls.seeded.length > 0)
+    expect(calls.written['/home/test/.claude/state/auto-handoff/old-session.md']).toContain('/home/test/.claude-edu/projects/-home-test-proj/old-session.jsonl')
+  })
+
+  test('with SessionStart sent past the mod, the first turn writes the missing templates', async ($, on) => {
+    const calls = engine(on, { tokens: 100_000, files: { '/home/test/.claude/auto-handoff/instructions.md': 'mine' } })
+    await $.turn.complete(TURN)
+    expect(calls.written['/home/test/.claude/auto-handoff/brief.md']).toBe(SHIPPED_BRIEF)
+    // A file the person already has is never overwritten.
+    expect(calls.written['/home/test/.claude/auto-handoff/instructions.md']).toBeUndefined()
   })
 
   test('a parent with no title leaves the fresh session untitled', async ($, on) => {
@@ -488,7 +554,7 @@ describe('auto-handoff', () => {
     await $.turn.complete(TURN)
     await settle(() => calls.cleared > 0)
     const brief = calls.written['/home/test/.claude/state/auto-handoff/old-session.md']
-    expect(brief).toContain('`~/.claude/projects/-home-test-proj/old-session.jsonl`')
+    expect(brief).toContain('`/home/test/.claude/projects/-home-test-proj/old-session.jsonl`')
     expect(brief).toContain('## How to Use This Brief')
     expect(brief).toContain('Finish the parser refactor')
     expect(brief).toContain('- feat(mods): auto-handoff (47edd8e)')
@@ -891,6 +957,19 @@ describe('auto-handoff', () => {
     await clock.advance(10_000)
     expect(await band($)).toContain('⚠ brief is facts only') // sticky
     await $.classic.SessionStart({ source: 'clear' })
+    expect(await band($)).toBe('')
+    expect(calls.seeded.length).toBe(1)
+  })
+
+  test("the person's own /clear dismisses the panel even with SessionStart sent past the mod", async ($, on) => {
+    const calls = engine(on, { tokens: 165_000, stepUsage: true, brief: null, clear: 'skipsMod' })
+    await $.turn.complete(TURN)
+    await settle(() => calls.seeded.length > 0)
+    calls.tokens = 47_000
+    await step($, 0)
+    await clock.advance(10_000)
+    expect(await band($)).toContain('⚠ brief is facts only') // sticky
+    await $.command.run({ command: 'clear', args: '', origin: { kind: 'composer' } } as never)
     expect(await band($)).toBe('')
     expect(calls.seeded.length).toBe(1)
   })

@@ -51,7 +51,8 @@ let unmeasured = 0
 let gated: string | undefined
 // From the latest SessionStart; /clear starts a new transcript file.
 let transcriptPath: string | undefined
-// The session's title (a /rename or the AI title) as the latest classic.UserPromptSubmit reported it.
+// The session's title (a /rename or the AI title) as the latest classic.UserPromptSubmit reported
+// it; when that event never reaches this mod, the handoff reads it from the transcript.
 let lastTitle: { session: string; title: string } | undefined
 // The title the seed prompt gives the fresh session, after its parent's.
 let seedTitle: string | undefined
@@ -61,6 +62,41 @@ let seedTitle: string | undefined
 // and pages landed inside the user's project.
 async function homeDir($: EngineInterface): Promise<string | undefined> {
   return (await $.env.get('HOME')) || (await $.env.get('USERPROFILE'))
+}
+
+// The session's transcript: from classic.SessionStart, else where Claude Code keeps it, under
+// CLAUDE_CONFIG_DIR when that is set. A plugin above this one can send SessionStart past it.
+async function transcriptFile($: EngineInterface, sessionId: string): Promise<string> {
+  if (transcriptPath) return transcriptPath
+  const home = await homeDir($) ?? '~'
+  const configDir = expand((await $.env.get('CLAUDE_CONFIG_DIR')) || `${home}/.claude`, home)
+  const cwd = await $.session.cwd()
+  // Claude Code keeps transcripts under the cwd with every non-alphanumeric character as '-'.
+  return `${configDir}/projects/${cwd.replace(/[^a-zA-Z0-9]/g, '-')}/${sessionId}.jsonl`
+}
+
+// The session's title as its transcript records it: the latest /rename, else the latest AI
+// title. For when classic.UserPromptSubmit, which carries the title, never reaches this mod.
+// grep, not $.fs.read: a transcript near the threshold is past the 4 MiB read limit.
+async function transcriptTitle($: EngineInterface, path: string, sessionId: string): Promise<string | undefined> {
+  try {
+    const { stdout } = await $.process.run(['grep', '-E', '"type":"(custom|ai)-title"', path])
+    let custom: string | undefined
+    let ai: string | undefined
+    for (const line of stdout.split('\n')) {
+      if (!line.trim()) continue
+      try {
+        const row = JSON.parse(line) as { type?: string; customTitle?: unknown; aiTitle?: unknown; sessionId?: string }
+        if (row.sessionId && row.sessionId !== sessionId) continue
+        if (row.type === 'custom-title' && typeof row.customTitle === 'string' && row.customTitle.trim()) custom = row.customTitle.trim()
+        if (row.type === 'ai-title' && typeof row.aiTitle === 'string' && row.aiTitle.trim()) ai = row.aiTitle.trim()
+      } catch {}
+    }
+    return custom ?? ai
+  } catch (err) {
+    await log($, `title read failed ${path} ${String(err)}`)
+    return undefined
+  }
 }
 
 async function log($: EngineInterface, line: string) {
@@ -98,8 +134,12 @@ async function template($: EngineInterface, key: TemplateKey): Promise<string> {
 }
 
 // A new session writes each template to its path if nothing is there yet, so the files exist
-// to be edited. A file the user wrote is never touched.
+// to be edited. A file the user wrote is never touched. Once per process: from the startup
+// SessionStart, or the first turn's end when a plugin above sends SessionStart past this mod.
+let templatesChecked = false
 async function writeMissingTemplates($: EngineInterface) {
+  if (templatesChecked) return
+  templatesChecked = true
   const home = await homeDir($) ?? ''
   for (const [key] of TEMPLATES) {
     const path = expand(cfg[key], home)
@@ -228,10 +268,10 @@ async function handoff($: EngineInterface, sessionId: string, tokens: number, th
     if (!problem && checked.flagged.length) await log($, `brief figures not in Handoff Numbers session=${sessionId}: ${checked.flagged.join(', ')}`)
     const home = await homeDir($)
     const cwd = await $.session.cwd()
+    const transcript = await transcriptFile($, sessionId)
     const brief = assembleBrief({
       sessionId,
-      // Claude Code keeps transcripts under the cwd with every non-alphanumeric character as '-'.
-      transcript: transcriptPath ?? `~/.claude/projects/${cwd.replace(/[^a-zA-Z0-9]/g, '-')}/${sessionId}.jsonl`,
+      transcript,
       instructions: await template($, 'instructionsTemplate') || LAST_RESORT_INSTRUCTIONS,
     }, facts, problem ? undefined : checked.text)
     const briefDir = `${home}/${BRIEF_DIR}`
@@ -241,7 +281,8 @@ async function handoff($: EngineInterface, sessionId: string, tokens: number, th
     const header = { from: own?.from, chain, depth: depth !== undefined ? String(depth) : undefined, tokens: String(tokens), at: new Date().toISOString(), cwd }
     await $.fs.write(briefPath, withHeader(header, brief))
     const link = await viewer($, briefDir, pagesDir, sessionId)
-    pending = { oldSession: sessionId, briefPath, tokens, chain, link, problem, title: lastTitle?.session === sessionId ? lastTitle.title : undefined }
+    const title = lastTitle?.session === sessionId ? lastTitle.title : await transcriptTitle($, transcript, sessionId)
+    pending = { oldSession: sessionId, briefPath, tokens, chain, link, problem, title }
     steps($, [briefStep(problem), { mark: 'spin', text: 'clearing' }])
     await $.store.set(`fired:${sessionId}`, problem ? `clearing-facts-only:${problem}` : 'clearing')
     await log($, `brief written ${briefPath} (${brief.length} chars); queueing /clear`)
@@ -444,11 +485,15 @@ export const register: Register = (on, options) => {
   on('turn.complete', async ($, e, next) => {
     const r = await next(e)
     try {
-      if (!e.agentId) await keepServing($)
+      if (!e.agentId) {
+        await writeMissingTemplates($)
+        await keepServing($)
+      }
       if (e.agentId || inFlight || pending) return r // subagent turns fire turn.complete too
+      const sessionId = await $.session.id()
+      if (seedTitle && sessionId === seededSession) renameSeeded($, sessionId)
       const tokens = (await $.session.usage()).context.tokens
       if (tokens === undefined) return r
-      const sessionId = await $.session.id()
       if (sessionId === seededSession && floor === undefined) {
         // Fallback only: turn.step sets the floor from the seed turn's first response. Reached
         // when that response carried no usage.
@@ -585,6 +630,15 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
+  // A /clear of the person's own leaves no handoff to report; the panel from the last one goes
+  // too. Here as well as in classic.SessionStart, which a plugin above can send past this mod.
+  // The mod's own /clear has a plugin origin, so a handoff's panel stays.
+  on('command.run', { command: 'clear' }, async ($, e, next) => {
+    const r = await next(e)
+    if (USER_ORIGINS.has(e.origin.kind) && !pending && !inFlight && shown) hidePanel($)
+    return r
+  })
+
   // Remembers the title for the next handoff, and names the fresh session after its parent's.
   on('classic.UserPromptSubmit', async ($, e, next) => {
     const r = await next(e)
@@ -611,6 +665,18 @@ export const register: Register = (on, options) => {
     if (e.source === 'clear' && pending) await seed($)
     return r
   })
+}
+
+// Names the fresh session after its parent with /rename, at the end of the seed turn. Reached
+// only when classic.UserPromptSubmit, which titles the seed prompt itself, never got here.
+// Not awaited: the /rename is queued until the session is idle, after this hook returns.
+function renameSeeded($: EngineInterface, sessionId: string) {
+  const title = seedTitle!
+  seedTitle = undefined
+  lastTitle = { session: sessionId, title }
+  $.command.run({ command: 'rename', args: title })
+    .then(() => log($, `titling session=${sessionId} "${title}" (/rename)`))
+    .catch((err: unknown) => log($, `rename rejected session=${sessionId} ${String(err)}`))
 }
 
 // A 'clearing' marker with no /clear pending for this session means the /clear never settled:
