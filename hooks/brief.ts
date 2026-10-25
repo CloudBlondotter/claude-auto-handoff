@@ -118,9 +118,28 @@ ${f.issues.length ? f.issues.join(', ') : 'None.'}`
   return withLastMessage ? `${all}\n\n## Last Real User Message (verbatim)\n${f.lastUserMessage ?? 'None found.'}` : all
 }
 
-export function briefPrompt(messages: readonly SessionMessage[], facts: Facts, template: string): string {
+// Asked in code, after the template, so a brief template the person edited still gets the question.
+function titleQuestion(title: string): string {
+  return `After the brief, add one last line, outside every section: "Session title: SAME" if the main task at the end of the conversation is still the one the session title "${title}" names, or "Session title: <new title>" if the main task has changed. A new title names the main task in 2 to 6 words, in the language of the current title, with no "pt" number.`
+}
+
+/** title: the session's current title, so Haiku can say whether the work has moved on from it. */
+export function briefPrompt(messages: readonly SessionMessage[], facts: Facts, template: string, title?: string): string {
   // Data first, instructions last.
-  return `## Extracted Facts\n${factsBlock(facts)}\n\n## Conversation\n${renderTranscript(messages)}\n\n---\n\n${template.trim()}`
+  const question = title ? `\n\n${titleQuestion(title)}` : ''
+  return `## Extracted Facts\n${factsBlock(facts)}\n\n## Conversation\n${renderTranscript(messages)}\n\n---\n\n${template.trim()}${question}`
+}
+
+const TITLE_LINE = /^[\s*_`]*Session title[\s*_`]*:[\s*_`"]*(.*?)[\s*_`"]*$/gim
+
+/**
+ * Takes the "Session title:" line out of Haiku's reply. verdict is undefined when there is no
+ * such line, "SAME" when the task is unchanged, else the new title.
+ */
+export function takeTitleVerdict(text: string): { text: string; verdict?: string } {
+  const lines = [...text.matchAll(TITLE_LINE)]
+  const verdict = lines.at(-1)?.[1]?.trim()
+  return { text: lines.length ? text.replace(TITLE_LINE, '').trimEnd() : text, verdict: verdict || undefined }
 }
 
 /** A reply that holds none of the template's sections is a dialogue fragment, not a brief. */

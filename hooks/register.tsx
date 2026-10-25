@@ -1,11 +1,11 @@
 import type { EngineInterface, Register, Timer } from 'claude-code'
-import { assembleBrief, briefPrompt, extractFacts, isValidBrief, markUnverifiedFigures } from './brief.ts'
+import { assembleBrief, briefPrompt, extractFacts, isValidBrief, markUnverifiedFigures, takeTitleVerdict } from './brief.ts'
 import { chainOf, parseBrief, renderPage, viewerLink, withHeader } from './viewer.ts'
 import type { Entry } from './viewer.ts'
 import { SERVER_JS, parseAddress } from './server.ts'
 import { isSpinning, panelTree } from './panel.tsx'
 import type { Line, Panel } from './panel.tsx'
-import { BRIEF_DIR, DEFAULTS, LAST_RESORT_INSTRUCTIONS, MIN_HEADROOM, SEED_PREFIX, TEMPLATES, expand, k, linkify, nextTitle, parseConfig, short } from './config.ts'
+import { BRIEF_DIR, DEFAULTS, LAST_RESORT_INSTRUCTIONS, MIN_HEADROOM, SEED_PREFIX, TEMPLATES, expand, freshTitle, k, linkify, parseConfig, short } from './config.ts'
 import type { Config, TemplateKey } from './config.ts'
 
 // At the token threshold, Haiku writes a handoff brief, the mod runs /clear, then seeds the
@@ -21,7 +21,7 @@ const CHARS_PER_TOKEN = 4
 // as "⚠ auto-handoff:", which reads as an error.
 const LOG = `~/${BRIEF_DIR}/auto-handoff.log`
 
-// problem: why the brief is facts only, when Haiku's summary was unusable.
+// problem: why the brief is facts only, when Haiku's summary was unusable. title: the fresh session's title.
 type Pending = { oldSession: string; briefPath: string; tokens: number; chain: string; link: string; problem?: string; title?: string }
 
 
@@ -253,22 +253,26 @@ async function handoff($: EngineInterface, sessionId: string, tokens: number, th
     const depth = own ? own.depth : 1
     if (depth !== undefined) facts.depth = depth
     const briefTemplate = await template($, 'briefTemplate')
+    const transcript = await transcriptFile($, sessionId)
+    const title = lastTitle?.session === sessionId ? lastTitle.title : await transcriptTitle($, transcript, sessionId)
     const result = await $.model.complete({
       model: 'haiku',
       system: 'You summarize coding sessions into precise handoff briefs.',
-      prompt: briefPrompt(messages, facts, briefTemplate),
+      prompt: briefPrompt(messages, facts, briefTemplate, title),
       maxTokens: 4_000,
       timeoutMs: 60_000,
     })
     // A failed, empty or sectionless reply falls back to the facts.
-    const text = result.isAnswered ? result.text : ''
+    const { text, verdict } = takeTitleVerdict(result.isAnswered ? result.text : '')
     const problem = !result.isAnswered ? result.reason : !text.trim() ? 'empty' : !isValidBrief(text, briefTemplate) ? 'no-sections' : undefined
     if (problem) await log($, `haiku brief unusable session=${sessionId} reason=${problem}; using facts-only brief`)
     const checked = markUnverifiedFigures(text, facts)
     if (!problem && checked.flagged.length) await log($, `brief figures not in Handoff Numbers session=${sessionId}: ${checked.flagged.join(', ')}`)
+    // Same task: "<title> ptN"; a new main task: its own name. A facts-only brief keeps the numbering.
+    const fresh = title ? freshTitle(title, problem ? undefined : verdict) : undefined
+    if (title) await log($, `title verdict session=${sessionId} parent="${title}" verdict=${verdict ? `"${verdict}"` : 'none'} fresh="${fresh}"`)
     const home = await homeDir($)
     const cwd = await $.session.cwd()
-    const transcript = await transcriptFile($, sessionId)
     const brief = assembleBrief({
       sessionId,
       transcript,
@@ -281,8 +285,7 @@ async function handoff($: EngineInterface, sessionId: string, tokens: number, th
     const header = { from: own?.from, chain, depth: depth !== undefined ? String(depth) : undefined, tokens: String(tokens), at: new Date().toISOString(), cwd }
     await $.fs.write(briefPath, withHeader(header, brief))
     const link = await viewer($, briefDir, pagesDir, sessionId)
-    const title = lastTitle?.session === sessionId ? lastTitle.title : await transcriptTitle($, transcript, sessionId)
-    pending = { oldSession: sessionId, briefPath, tokens, chain, link, problem, title }
+    pending = { oldSession: sessionId, briefPath, tokens, chain, link, problem, title: fresh }
     steps($, [briefStep(problem), { mark: 'spin', text: 'clearing' }])
     await $.store.set(`fired:${sessionId}`, problem ? `clearing-facts-only:${problem}` : 'clearing')
     await log($, `brief written ${briefPath} (${brief.length} chars); queueing /clear`)
@@ -709,7 +712,7 @@ async function seed($: EngineInterface) {
     await $.store.set(`fired:${p.oldSession}`, `seeded:${newSession}`)
     await log($, `seeding new=${newSession} from=${p.oldSession}`)
     handedFrom = { session: p.oldSession, tokens: p.tokens, link: p.link, problem: p.problem }
-    seedTitle = p.title ? nextTitle(p.title) : undefined
+    seedTitle = p.title
     steps($, [briefStep(p.problem), { mark: 'done', text: 'cleared' }, { mark: 'spin', text: 'starting the fresh session' }])
     const own = await storedLineage($, p.oldSession)
     const prior = own ? own.depth : 1

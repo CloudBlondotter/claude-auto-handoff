@@ -37,6 +37,14 @@ export function nextTitle(title: string): string {
   const m = /^(.*\S)\s+pt(\d+)$/.exec(t)
   return m ? `${m[1]} pt${Number(m[2]) + 1}` : `${t} pt2`
 }
+// The fresh session's title from Haiku's verdict: "SAME", no verdict, or a verdict that only
+// repeats the parent's title keeps the pt numbering; anything else is the new task's name.
+export function freshTitle(parent: string, verdict?: string): string {
+  const v = verdict?.replace(/\s+pt\d+$/i, '').trim().slice(0, 80).trim()
+  const base = parent.trim().replace(/\s+pt\d+$/, '')
+  if (!v || /^same\.?$/i.test(v) || v.toLowerCase() === base.toLowerCase()) return nextTitle(parent)
+  return v
+}
 export const expand = (path: string, home: string) => path.replace(/^~(?=\/|$)/, home)
 
 // A non-positive or non-numeric value falls back to the default rather than handing off at 0.

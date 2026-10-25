@@ -1,10 +1,10 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { TestBody } from 'claude-code/testing'
 import type { On, SessionMessage } from 'claude-code'
-import { briefPrompt, extractFacts, factsBlock, hasUnansweredLastRequest, isValidBrief, markUnverifiedFigures } from '../hooks/brief.ts'
+import { briefPrompt, extractFacts, factsBlock, hasUnansweredLastRequest, isValidBrief, markUnverifiedFigures, takeTitleVerdict } from '../hooks/brief.ts'
 import { renderTemplate } from '../hooks/templates.ts'
 import { parseBrief } from '../hooks/viewer.ts'
-import { nextTitle } from '../hooks/config.ts'
+import { freshTitle, nextTitle } from '../hooks/config.ts'
 
 type Calls = { compacts: number; steps: number; cleared: number; seeded: string[]; written: Record<string, string>; completes: number; tokens: number; prompts: string[]; toasts: string[]; ran: number; renamed: string[] }
 
@@ -254,6 +254,38 @@ describe('auto-handoff', () => {
     // Only the seed is retitled; the person's next prompt leaves the title alone.
     const typed = await $.classic.UserPromptSubmit({ prompt: 'carry on', session_id: 'new-session-1', session_title: 'IAS025 Albaranes pt2' })
     expect(typed.sessionTitle).toBeUndefined()
+  })
+
+  test('when the main task changed, the fresh session takes the new task name', async ($, on) => {
+    const calls = engine(on, { tokens: 165_000, clear: 'skipsMod', brief: '## Next Step\nExport the invoices.\n\nSession title: Facturas export' })
+    await $.classic.UserPromptSubmit({ prompt: 'now the invoices', session_id: 'old-session', session_title: 'IAS025 Albaranes pt2' })
+    await $.turn.complete(TURN)
+    await settle(() => calls.seeded.length > 0)
+    expect(calls.prompts[0]).toContain('the session title "IAS025 Albaranes pt2"')
+    // The verdict line is for the mod, not the next session.
+    const brief = calls.written['/home/test/.claude/state/auto-handoff/old-session.md'] ?? ''
+    expect(brief).toContain('Export the invoices.')
+    expect(brief).not.toContain('Session title')
+    const seeded = await $.classic.UserPromptSubmit({ prompt: calls.seeded[0]!, session_id: 'new-session-1' })
+    expect(seeded.sessionTitle).toBe('Facturas export')
+  })
+
+  test('when Haiku says SAME, the fresh session counts on', async ($, on) => {
+    const calls = engine(on, { tokens: 165_000, clear: 'skipsMod', brief: '## Next Step\nFinish the parser.\n\nSession title: SAME' })
+    await $.classic.UserPromptSubmit({ prompt: 'fix the parser', session_id: 'old-session', session_title: 'IAS025 Albaranes pt2' })
+    await $.turn.complete(TURN)
+    await settle(() => calls.seeded.length > 0)
+    const seeded = await $.classic.UserPromptSubmit({ prompt: calls.seeded[0]!, session_id: 'new-session-1' })
+    expect(seeded.sessionTitle).toBe('IAS025 Albaranes pt3')
+  })
+
+  test('a facts-only brief keeps the pt numbering', async ($, on) => {
+    const calls = engine(on, { tokens: 165_000, clear: 'skipsMod', brief: null })
+    await $.classic.UserPromptSubmit({ prompt: 'fix the parser', session_id: 'old-session', session_title: 'IAS025 Albaranes' })
+    await $.turn.complete(TURN)
+    await settle(() => calls.seeded.length > 0)
+    const seeded = await $.classic.UserPromptSubmit({ prompt: calls.seeded[0]!, session_id: 'new-session-1' })
+    expect(seeded.sessionTitle).toBe('IAS025 Albaranes pt2')
   })
 
   test('with UserPromptSubmit sent past the mod, the title comes from the transcript and /rename sets it', async ($, on) => {
@@ -1059,6 +1091,38 @@ describe('nextTitle', () => {
     expect(nextTitle('IAS025 Albaranes')).toBe('IAS025 Albaranes pt2')
     expect(nextTitle('IAS025 Albaranes pt2')).toBe('IAS025 Albaranes pt3')
     expect(nextTitle(' IAS025 Albaranes pt9 ')).toBe('IAS025 Albaranes pt10')
+  })
+})
+
+describe('freshTitle', () => {
+  test('the same task, or no verdict, keeps counting', () => {
+    expect(freshTitle('IAS025 Albaranes', 'SAME')).toBe('IAS025 Albaranes pt2')
+    expect(freshTitle('IAS025 Albaranes pt2', 'same.')).toBe('IAS025 Albaranes pt3')
+    expect(freshTitle('IAS025 Albaranes pt2', undefined)).toBe('IAS025 Albaranes pt3')
+    expect(freshTitle('IAS025 Albaranes pt2', 'IAS025 Albaranes pt3')).toBe('IAS025 Albaranes pt3')
+  })
+
+  test('a new main task takes its own name, with no pt', () => {
+    expect(freshTitle('IAS025 Albaranes pt3', 'Badge caveman statusline')).toBe('Badge caveman statusline')
+    expect(freshTitle('IAS025 Albaranes', 'Facturas export pt2')).toBe('Facturas export')
+  })
+})
+
+describe('takeTitleVerdict', () => {
+  test('takes the last title line out of the brief', () => {
+    const r = takeTitleVerdict('## Next Step\nShip it.\n\n**Session title:** "Facturas export"')
+    expect(r.verdict).toBe('Facturas export')
+    expect(r.text).toBe('## Next Step\nShip it.')
+  })
+
+  test('no line, no verdict, text untouched', () => {
+    expect(takeTitleVerdict('## Next Step\nShip it.')).toEqual({ text: '## Next Step\nShip it.', verdict: undefined })
+  })
+
+  test('the prompt asks only when there is a title', () => {
+    const facts = { filesModified: [], commits: [], issues: [] }
+    expect(briefPrompt([], facts, 'TEMPLATE', 'IAS025 Albaranes')).toContain('Session title: SAME')
+    expect(briefPrompt([], facts, 'TEMPLATE')).not.toContain('Session title')
   })
 })
 
